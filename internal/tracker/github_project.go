@@ -338,20 +338,20 @@ func (t *GitHubProjectTracker) GetIssue(ctx context.Context, number int) (*Issue
 
 // CreateProjectWithStatuses creates a new GitHub Project V2 with the required status fields
 // EnsureStatuses ensures the project's Status field has exactly the required options.
-// Works on any existing project — idempotent. Must call Init first.
+// Uses `gh project field-edit` which is the supported way to manage single-select options.
+// Idempotent — safe to re-run.
 func (t *GitHubProjectTracker) EnsureStatuses(ctx context.Context, statuses []string) error {
 	if t.projectID == "" {
 		return fmt.Errorf("project not initialized — call Init first")
 	}
 
-	// Discover the Status field and its existing options
+	// Discover the Status field ID
 	fieldQuery := fmt.Sprintf(`query {
 		node(id: %q) {
 			... on ProjectV2 {
 				field(name: "Status") {
 					... on ProjectV2SingleSelectField {
 						id
-						options { id name }
 					}
 				}
 			}
@@ -367,11 +367,7 @@ func (t *GitHubProjectTracker) EnsureStatuses(ctx context.Context, statuses []st
 		Data struct {
 			Node struct {
 				Field struct {
-					ID      string `json:"id"`
-					Options []struct {
-						ID   string `json:"id"`
-						Name string `json:"name"`
-					} `json:"options"`
+					ID string `json:"id"`
 				} `json:"field"`
 			} `json:"node"`
 		} `json:"data"`
@@ -380,60 +376,47 @@ func (t *GitHubProjectTracker) EnsureStatuses(ctx context.Context, statuses []st
 		return fmt.Errorf("failed to parse Status field response: %w", err)
 	}
 
-	t.statusFieldID = fieldResp.Data.Node.Field.ID
-
-	// Build set of existing option names
-	existing := make(map[string]bool)
-	for _, opt := range fieldResp.Data.Node.Field.Options {
-		existing[opt.Name] = true
+	fieldID := fieldResp.Data.Node.Field.ID
+	if fieldID == "" {
+		return fmt.Errorf("could not find Status field on project")
 	}
+	t.statusFieldID = fieldID
 
-	// Create missing status options
-	for _, status := range statuses {
-		if existing[status] {
-			fmt.Printf("  Status %q already exists\n", status)
-			continue
-		}
-
-		createOptMutation := fmt.Sprintf(`mutation {
-			createProjectV2FieldOption(input: {
-				projectId: %q
-				fieldId: %q
-				name: %q
-			}) {
-				projectV2FieldOption { id name }
-			}
-		}`, t.projectID, t.statusFieldID, status)
-
-		if _, err := t.ghGraphQL(ctx, createOptMutation); err != nil {
-			return fmt.Errorf("failed to create status option %q: %w", status, err)
-		}
-		fmt.Printf("  Created status %q\n", status)
+	// Build JSON options array for gh project field-edit
+	var opts []string
+	colors := map[string]string{
+		"Backlog":      "GRAY",
+		"Todo":         "BLUE",
+		"Research":     "PURPLE",
+		"Planning":     "PINK",
+		"In Progress":  "YELLOW",
+		"Validation":   "ORANGE",
+		"Human Review": "RED",
+		"Done":         "GREEN",
+		"Cancelled":    "GRAY",
 	}
-
-	// Delete options that aren't in the required set
-	required := make(map[string]bool)
 	for _, s := range statuses {
-		required[s] = true
-	}
-	for _, opt := range fieldResp.Data.Node.Field.Options {
-		if !required[opt.Name] {
-			deleteOptMutation := fmt.Sprintf(`mutation {
-				deleteProjectV2FieldOption(input: {
-					projectId: %q
-					fieldId: %q
-					optionId: %q
-				}) {
-					projectV2FieldOption { id }
-				}
-			}`, t.projectID, t.statusFieldID, opt.ID)
-
-			if _, err := t.ghGraphQL(ctx, deleteOptMutation); err != nil {
-				fmt.Printf("  Warning: could not remove status %q: %v\n", opt.Name, err)
-			} else {
-				fmt.Printf("  Removed status %q\n", opt.Name)
-			}
+		color := colors[s]
+		if color == "" {
+			color = "GRAY"
 		}
+		opts = append(opts, fmt.Sprintf(`{"name":%q,"color":%q}`, s, color))
+	}
+	optsJSON := "[" + strings.Join(opts, ",") + "]"
+
+	// Use gh project field-edit to set all options at once
+	cmd := exec.CommandContext(ctx, "gh", "project", "field-edit",
+		fieldID,
+		"--project-id", t.projectID,
+		"--single-select-options", optsJSON,
+	)
+	editOut, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to configure status options: %s", strings.TrimSpace(string(editOut)))
+	}
+
+	for _, s := range statuses {
+		fmt.Printf("  Status %q configured\n", s)
 	}
 
 	return nil

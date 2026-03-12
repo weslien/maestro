@@ -23,13 +23,22 @@ import (
 	"github.com/weslien/maestro/internal/tui"
 )
 
-var cfgFile string
+var (
+	cfgFile string
+
+	// Set via ldflags at build time:
+	//   go build -ldflags "-X main.version=v0.1.0 -X main.commit=abc123 -X main.date=2024-01-01"
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
 
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "maestro",
 		Short: "GSD-powered GitHub Projects orchestrator",
 		Long:  "Maestro polls GitHub Projects V2 for issues and runs each through a GSD-style lifecycle using Claude Code agents.",
+		Version: fmt.Sprintf("%s (commit: %s, built: %s)", version, commit, date),
 	}
 
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "WORKFLOW.md", "path to WORKFLOW.md config file")
