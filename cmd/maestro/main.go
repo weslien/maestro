@@ -19,6 +19,7 @@ import (
 	"github.com/weslien/maestro/internal/config"
 	"github.com/weslien/maestro/internal/lifecycle"
 	"github.com/weslien/maestro/internal/orchestrator"
+	"github.com/weslien/maestro/internal/seed"
 	"github.com/weslien/maestro/internal/tracker"
 	"github.com/weslien/maestro/internal/tui"
 )
@@ -46,6 +47,7 @@ func main() {
 	rootCmd.AddCommand(
 		initCmd(),
 		setupCmd(),
+		seedCmd(),
 		runCmd(),
 		statusCmd(),
 		stopCmd(),
@@ -131,6 +133,55 @@ updates WORKFLOW.md with the project number.`,
 				}
 			}
 
+			return nil
+		},
+	}
+}
+
+func seedCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "seed",
+		Short: "Seed GitHub Project with GSD phases from stclaude",
+		Long:  "Reads GSD project state via stclaude CLI and creates GitHub issues for each phase on the project board.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+
+			cwd, _ := os.Getwd()
+			fmt.Printf("Reading GSD state from %s...\n", cwd)
+
+			state, err := seed.ReadGSDState(cmd.Context(), cwd)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("Project: %s\n", state.Data.Project.Name)
+			fmt.Printf("Phases: %d\n\n", len(state.Data.Phases))
+
+			trk := tracker.NewGitHubProjectTracker(cfg.Tracker.Owner, cfg.Tracker.Repo, cfg.Tracker.ProjectNumber)
+			if err := trk.Init(cmd.Context()); err != nil {
+				return fmt.Errorf("failed to initialize tracker: %w", err)
+			}
+
+			result, err := seed.Seed(cmd.Context(), trk, state, cfg.Tracker.Repo)
+			if err != nil {
+				return err
+			}
+
+			for _, msg := range result.Created {
+				fmt.Printf("  + %s\n", msg)
+			}
+			for _, msg := range result.Skipped {
+				fmt.Printf("  ~ %s\n", msg)
+			}
+			for _, msg := range result.Errors {
+				fmt.Printf("  ! %s\n", msg)
+			}
+
+			fmt.Printf("\nCreated: %d, Skipped: %d, Errors: %d\n",
+				len(result.Created), len(result.Skipped), len(result.Errors))
 			return nil
 		},
 	}
