@@ -80,7 +80,10 @@ func initCmd() *cobra.Command {
 func setupCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "setup",
-		Short: "Create a GitHub Project with required status fields",
+		Short: "Ensure a GitHub Project exists with required status fields",
+		Long: `If project_number is set in WORKFLOW.md, ensures that project has
+the correct status fields. Otherwise creates a new project and
+updates WORKFLOW.md with the project number.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
 			if err != nil {
@@ -90,14 +93,32 @@ func setupCmd() *cobra.Command {
 			trk := tracker.NewGitHubProjectTracker(cfg.Tracker.Owner, cfg.Tracker.Repo, cfg.Tracker.ProjectNumber)
 			statuses := lifecycle.AllStatuses()
 
-			fmt.Printf("Creating GitHub Project for %s...\n", cfg.Tracker.Owner)
-			if err := trk.CreateProjectWithStatuses(cmd.Context(), "Maestro Board", statuses); err != nil {
-				return err
-			}
+			if cfg.Tracker.ProjectNumber > 0 {
+				// Existing project — just ensure statuses
+				fmt.Printf("Configuring existing project #%d for %s...\n", cfg.Tracker.ProjectNumber, cfg.Tracker.Owner)
+				if err := trk.Init(cmd.Context()); err != nil {
+					return fmt.Errorf("failed to find project #%d: %w", cfg.Tracker.ProjectNumber, err)
+				}
+				if err := trk.EnsureStatuses(cmd.Context(), statuses); err != nil {
+					return err
+				}
+				fmt.Println("\nProject statuses configured.")
+			} else {
+				// Create new project
+				fmt.Printf("Creating GitHub Project for %s...\n", cfg.Tracker.Owner)
+				if err := trk.CreateProject(cmd.Context(), "Maestro Board"); err != nil {
+					return err
+				}
+				fmt.Printf("Created project #%d\n", trk.ProjectNumber())
 
-			// Auto-update WORKFLOW.md with the new project number
-			if _, statErr := os.Stat(cfgFile); statErr == nil {
-				patchProjectNumber(cfgFile, trk.ProjectNumber())
+				if err := trk.EnsureStatuses(cmd.Context(), statuses); err != nil {
+					return err
+				}
+
+				// Auto-update WORKFLOW.md with the new project number
+				if _, statErr := os.Stat(cfgFile); statErr == nil {
+					patchProjectNumber(cfgFile, trk.ProjectNumber())
+				}
 			}
 
 			return nil

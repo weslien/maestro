@@ -337,81 +337,12 @@ func (t *GitHubProjectTracker) GetIssue(ctx context.Context, number int) (*Issue
 }
 
 // CreateProjectWithStatuses creates a new GitHub Project V2 with the required status fields
-func (t *GitHubProjectTracker) CreateProjectWithStatuses(ctx context.Context, title string, statuses []string) error {
-	// Create project
-
-	// First we need the owner's node ID
-	ownerQuery := fmt.Sprintf(`query {
-		user(login: %q) { id }
-	}`, t.owner)
-
-	out, err := t.ghGraphQL(ctx, ownerQuery)
-	if err != nil {
-		// Try org
-		ownerQuery = fmt.Sprintf(`query {
-			organization(login: %q) { id }
-		}`, t.owner)
-		out, err = t.ghGraphQL(ctx, ownerQuery)
-		if err != nil {
-			return fmt.Errorf("failed to get owner ID: %w", err)
-		}
+// EnsureStatuses ensures the project's Status field has exactly the required options.
+// Works on any existing project — idempotent. Must call Init first.
+func (t *GitHubProjectTracker) EnsureStatuses(ctx context.Context, statuses []string) error {
+	if t.projectID == "" {
+		return fmt.Errorf("project not initialized — call Init first")
 	}
-
-	var ownerResp struct {
-		Data struct {
-			User         *struct{ ID string } `json:"user"`
-			Organization *struct{ ID string } `json:"organization"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(out, &ownerResp); err != nil {
-		return fmt.Errorf("failed to parse owner response: %w", err)
-	}
-
-	ownerID := ""
-	if ownerResp.Data.User != nil {
-		ownerID = ownerResp.Data.User.ID
-	} else if ownerResp.Data.Organization != nil {
-		ownerID = ownerResp.Data.Organization.ID
-	}
-	if ownerID == "" {
-		return fmt.Errorf("could not determine owner node ID for %s", t.owner)
-	}
-
-	createMutation := fmt.Sprintf(`mutation {
-		createProjectV2(input: {
-			ownerId: %q
-			title: %q
-		}) {
-			projectV2 {
-				id
-				number
-			}
-		}
-	}`, ownerID, title)
-
-	out, err = t.ghGraphQL(ctx, createMutation)
-	if err != nil {
-		return fmt.Errorf("failed to create project: %w", err)
-	}
-
-	var createResp struct {
-		Data struct {
-			CreateProjectV2 struct {
-				ProjectV2 struct {
-					ID     string `json:"id"`
-					Number int    `json:"number"`
-				} `json:"projectV2"`
-			} `json:"createProjectV2"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(out, &createResp); err != nil {
-		return fmt.Errorf("failed to parse create response: %w", err)
-	}
-
-	t.projectID = createResp.Data.CreateProjectV2.ProjectV2.ID
-	t.projectNumber = createResp.Data.CreateProjectV2.ProjectV2.Number
-
-	fmt.Printf("Created project #%d\n", t.projectNumber)
 
 	// Discover the Status field and its existing options
 	fieldQuery := fmt.Sprintf(`query {
@@ -427,7 +358,7 @@ func (t *GitHubProjectTracker) CreateProjectWithStatuses(ctx context.Context, ti
 		}
 	}`, t.projectID)
 
-	out, err = t.ghGraphQL(ctx, fieldQuery)
+	out, err := t.ghGraphQL(ctx, fieldQuery)
 	if err != nil {
 		return fmt.Errorf("failed to query Status field: %w", err)
 	}
@@ -480,7 +411,7 @@ func (t *GitHubProjectTracker) CreateProjectWithStatuses(ctx context.Context, ti
 		fmt.Printf("  Created status %q\n", status)
 	}
 
-	// Delete default options that aren't in our required set
+	// Delete options that aren't in the required set
 	required := make(map[string]bool)
 	for _, s := range statuses {
 		required[s] = true
@@ -498,15 +429,90 @@ func (t *GitHubProjectTracker) CreateProjectWithStatuses(ctx context.Context, ti
 			}`, t.projectID, t.statusFieldID, opt.ID)
 
 			if _, err := t.ghGraphQL(ctx, deleteOptMutation); err != nil {
-				fmt.Printf("  Warning: could not remove default status %q: %v\n", opt.Name, err)
+				fmt.Printf("  Warning: could not remove status %q: %v\n", opt.Name, err)
 			} else {
-				fmt.Printf("  Removed default status %q\n", opt.Name)
+				fmt.Printf("  Removed status %q\n", opt.Name)
 			}
 		}
 	}
 
-	fmt.Printf("\nProject ready! Set project_number: %d in your WORKFLOW.md\n", t.projectNumber)
 	return nil
+}
+
+// CreateProject creates a new GitHub Project V2 and returns its number.
+func (t *GitHubProjectTracker) CreateProject(ctx context.Context, title string) error {
+	ownerID, err := t.resolveOwnerID(ctx)
+	if err != nil {
+		return err
+	}
+
+	createMutation := fmt.Sprintf(`mutation {
+		createProjectV2(input: {
+			ownerId: %q
+			title: %q
+		}) {
+			projectV2 {
+				id
+				number
+			}
+		}
+	}`, ownerID, title)
+
+	out, err := t.ghGraphQL(ctx, createMutation)
+	if err != nil {
+		return fmt.Errorf("failed to create project: %w", err)
+	}
+
+	var createResp struct {
+		Data struct {
+			CreateProjectV2 struct {
+				ProjectV2 struct {
+					ID     string `json:"id"`
+					Number int    `json:"number"`
+				} `json:"projectV2"`
+			} `json:"createProjectV2"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &createResp); err != nil {
+		return fmt.Errorf("failed to parse create response: %w", err)
+	}
+
+	t.projectID = createResp.Data.CreateProjectV2.ProjectV2.ID
+	t.projectNumber = createResp.Data.CreateProjectV2.ProjectV2.Number
+	return nil
+}
+
+func (t *GitHubProjectTracker) resolveOwnerID(ctx context.Context) (string, error) {
+	// Try user first
+	ownerQuery := fmt.Sprintf(`query { user(login: %q) { id } }`, t.owner)
+	out, err := t.ghGraphQL(ctx, ownerQuery)
+	if err == nil {
+		var resp struct {
+			Data struct {
+				User *struct{ ID string } `json:"user"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(out, &resp) == nil && resp.Data.User != nil {
+			return resp.Data.User.ID, nil
+		}
+	}
+
+	// Try org
+	orgQuery := fmt.Sprintf(`query { organization(login: %q) { id } }`, t.owner)
+	out, err = t.ghGraphQL(ctx, orgQuery)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve owner %q: %w", t.owner, err)
+	}
+
+	var resp struct {
+		Data struct {
+			Organization *struct{ ID string } `json:"organization"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil || resp.Data.Organization == nil {
+		return "", fmt.Errorf("could not determine owner node ID for %s", t.owner)
+	}
+	return resp.Data.Organization.ID, nil
 }
 
 // ProjectNumber returns the project number (useful after CreateProjectWithStatuses)
