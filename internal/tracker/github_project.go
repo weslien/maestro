@@ -10,13 +10,17 @@ import (
 	"time"
 )
 
+// fieldName is the custom single-select field maestro uses for lifecycle tracking.
+// We use a custom field because the built-in "Status" field can't be modified via API.
+const fieldName = "Phase"
+
 type GitHubProjectTracker struct {
 	owner         string
 	repo          string
 	projectNumber int
 	projectID     string
-	statusFieldID string
-	statusOptions map[string]string // status name -> option ID
+	fieldID       string
+	fieldOptions  map[string]string // option name -> option ID
 }
 
 func NewGitHubProjectTracker(owner, repo string, projectNumber int) *GitHubProjectTracker {
@@ -24,31 +28,29 @@ func NewGitHubProjectTracker(owner, repo string, projectNumber int) *GitHubProje
 		owner:         owner,
 		repo:          repo,
 		projectNumber: projectNumber,
-		statusOptions: make(map[string]string),
+		fieldOptions:  make(map[string]string),
 	}
 }
 
-// Init discovers the project ID and status field options
+// Init discovers the project ID and Phase field options.
 func (t *GitHubProjectTracker) Init(ctx context.Context) error {
-	// Query project ID and status field
+	// Discover project ID first
+	if err := t.discoverProject(ctx); err != nil {
+		return err
+	}
+
+	// Find the Phase field
+	return t.discoverField(ctx)
+}
+
+func (t *GitHubProjectTracker) discoverProject(ctx context.Context) error {
+	// Try user first
 	query := fmt.Sprintf(`query {
 		user(login: %q) {
-			projectV2(number: %d) {
-				id
-				field(name: "Status") {
-					... on ProjectV2SingleSelectField {
-						id
-						options {
-							id
-							name
-						}
-					}
-				}
-			}
+			projectV2(number: %d) { id }
 		}
 	}`, t.owner, t.projectNumber)
 
-	// Try user first, fall back to organization
 	out, err := t.ghGraphQL(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to query project: %w", err)
@@ -57,82 +59,95 @@ func (t *GitHubProjectTracker) Init(ctx context.Context) error {
 	var resp struct {
 		Data struct {
 			User *struct {
-				ProjectV2 *projectV2Response `json:"projectV2"`
+				ProjectV2 *struct {
+					ID string `json:"id"`
+				} `json:"projectV2"`
 			} `json:"user"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(out, &resp) == nil && resp.Data.User != nil && resp.Data.User.ProjectV2 != nil {
+		t.projectID = resp.Data.User.ProjectV2.ID
+		return nil
+	}
+
+	// Try org
+	orgQuery := fmt.Sprintf(`query {
+		organization(login: %q) {
+			projectV2(number: %d) { id }
+		}
+	}`, t.owner, t.projectNumber)
+
+	out, err = t.ghGraphQL(ctx, orgQuery)
+	if err != nil {
+		return fmt.Errorf("failed to query org project: %w", err)
+	}
+
+	var orgResp struct {
+		Data struct {
 			Organization *struct {
-				ProjectV2 *projectV2Response `json:"projectV2"`
+				ProjectV2 *struct {
+					ID string `json:"id"`
+				} `json:"projectV2"`
 			} `json:"organization"`
 		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
+	}
+	if json.Unmarshal(out, &orgResp) == nil && orgResp.Data.Organization != nil && orgResp.Data.Organization.ProjectV2 != nil {
+		t.projectID = orgResp.Data.Organization.ProjectV2.ID
+		return nil
 	}
 
-	if err := json.Unmarshal(out, &resp); err != nil {
-		return fmt.Errorf("failed to parse project response: %w", err)
-	}
+	return fmt.Errorf("project #%d not found for %s", t.projectNumber, t.owner)
+}
 
-	var proj *projectV2Response
-	if resp.Data.User != nil && resp.Data.User.ProjectV2 != nil {
-		proj = resp.Data.User.ProjectV2
-	}
-
-	// Try org query if user query didn't find the project
-	if proj == nil {
-		orgQuery := fmt.Sprintf(`query {
-			organization(login: %q) {
-				projectV2(number: %d) {
-					id
-					field(name: "Status") {
-						... on ProjectV2SingleSelectField {
-							id
-							options {
-								id
-								name
-							}
-						}
+func (t *GitHubProjectTracker) discoverField(ctx context.Context) error {
+	query := fmt.Sprintf(`query {
+		node(id: %q) {
+			... on ProjectV2 {
+				field(name: %q) {
+					... on ProjectV2SingleSelectField {
+						id
+						options { id name }
 					}
 				}
 			}
-		}`, t.owner, t.projectNumber)
-
-		out, err = t.ghGraphQL(ctx, orgQuery)
-		if err != nil {
-			return fmt.Errorf("failed to query org project: %w", err)
 		}
+	}`, t.projectID, fieldName)
 
-		if err := json.Unmarshal(out, &resp); err != nil {
-			return fmt.Errorf("failed to parse org project response: %w", err)
-		}
-
-		if resp.Data.Organization != nil && resp.Data.Organization.ProjectV2 != nil {
-			proj = resp.Data.Organization.ProjectV2
-		}
+	out, err := t.ghGraphQL(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to query %s field: %w", fieldName, err)
 	}
 
-	if proj == nil {
-		return fmt.Errorf("project #%d not found for %s", t.projectNumber, t.owner)
+	var resp struct {
+		Data struct {
+			Node struct {
+				Field *struct {
+					ID      string        `json:"id"`
+					Options []fieldOption `json:"options"`
+				} `json:"field"`
+			} `json:"node"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return fmt.Errorf("failed to parse field response: %w", err)
 	}
 
-	t.projectID = proj.ID
-	t.statusFieldID = proj.Field.ID
+	if resp.Data.Node.Field == nil || resp.Data.Node.Field.ID == "" {
+		return fmt.Errorf("%q field not found on project #%d — run 'maestro setup' to create it", fieldName, t.projectNumber)
+	}
 
-	for _, opt := range proj.Field.Options {
-		t.statusOptions[opt.Name] = opt.ID
+	t.fieldID = resp.Data.Node.Field.ID
+	t.fieldOptions = make(map[string]string)
+	for _, opt := range resp.Data.Node.Field.Options {
+		t.fieldOptions[opt.Name] = opt.ID
 	}
 
 	return nil
 }
 
-type projectV2Response struct {
-	ID    string `json:"id"`
-	Field struct {
-		ID      string `json:"id"`
-		Options []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"options"`
-	} `json:"field"`
+type fieldOption struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 func (t *GitHubProjectTracker) Poll(ctx context.Context) ([]Issue, error) {
@@ -142,7 +157,7 @@ func (t *GitHubProjectTracker) Poll(ctx context.Context) ([]Issue, error) {
 				items(first: 100) {
 					nodes {
 						id
-						fieldValueByName(name: "Status") {
+						fieldValueByName(name: %q) {
 							... on ProjectV2ItemFieldSingleSelectValue {
 								name
 							}
@@ -166,7 +181,7 @@ func (t *GitHubProjectTracker) Poll(ctx context.Context) ([]Issue, error) {
 				}
 			}
 		}
-	}`, t.projectID)
+	}`, t.projectID, fieldName)
 
 	out, err := t.ghGraphQL(ctx, query)
 	if err != nil {
@@ -239,9 +254,9 @@ func (t *GitHubProjectTracker) Poll(ctx context.Context) ([]Issue, error) {
 }
 
 func (t *GitHubProjectTracker) UpdateStatus(ctx context.Context, issue Issue, newStatus string) error {
-	optionID, ok := t.statusOptions[newStatus]
+	optionID, ok := t.fieldOptions[newStatus]
 	if !ok {
-		return fmt.Errorf("unknown status %q, available: %v", newStatus, t.availableStatuses())
+		return fmt.Errorf("unknown phase %q, available: %v", newStatus, t.availableStatuses())
 	}
 
 	mutation := fmt.Sprintf(`mutation {
@@ -255,11 +270,11 @@ func (t *GitHubProjectTracker) UpdateStatus(ctx context.Context, issue Issue, ne
 				id
 			}
 		}
-	}`, t.projectID, issue.ProjectItemID, t.statusFieldID, optionID)
+	}`, t.projectID, issue.ProjectItemID, t.fieldID, optionID)
 
 	_, err := t.ghGraphQL(ctx, mutation)
 	if err != nil {
-		return fmt.Errorf("failed to update status to %q: %w", newStatus, err)
+		return fmt.Errorf("failed to update phase to %q: %w", newStatus, err)
 	}
 
 	return nil
@@ -336,111 +351,61 @@ func (t *GitHubProjectTracker) GetIssue(ctx context.Context, number int) (*Issue
 	}, nil
 }
 
-// CreateProjectWithStatuses creates a new GitHub Project V2 with the required status fields
-// EnsureStatuses replaces the project's Status field with one containing exactly
-// the required options. Deletes the default Status field and creates a new one.
-// Idempotent — safe to re-run.
-func (t *GitHubProjectTracker) EnsureStatuses(ctx context.Context, statuses []string) error {
+// EnsurePhaseField creates the custom "Phase" single-select field with all
+// required options. Idempotent — skips if field already has the right options.
+func (t *GitHubProjectTracker) EnsurePhaseField(ctx context.Context, statuses []string) error {
 	if t.projectID == "" {
-		return fmt.Errorf("project not initialized — call Init first")
+		return fmt.Errorf("project not initialized")
 	}
 
-	// Discover the existing Status field ID via GraphQL
-	fieldQuery := fmt.Sprintf(`query {
-		node(id: %q) {
-			... on ProjectV2 {
-				field(name: "Status") {
-					... on ProjectV2SingleSelectField {
-						id
-						options { id name }
-					}
-				}
+	// Check if Phase field already exists
+	err := t.discoverField(ctx)
+	if err == nil {
+		// Field exists — check if options match
+		have := make(map[string]bool, len(t.fieldOptions))
+		for name := range t.fieldOptions {
+			have[name] = true
+		}
+		allPresent := true
+		for _, s := range statuses {
+			if !have[s] {
+				allPresent = false
+				break
 			}
 		}
-	}`, t.projectID)
+		if allPresent && len(t.fieldOptions) == len(statuses) {
+			fmt.Printf("  %s field already configured correctly\n", fieldName)
+			return nil
+		}
 
-	out, err := t.ghGraphQL(ctx, fieldQuery)
-	if err != nil {
-		return fmt.Errorf("failed to query Status field: %w", err)
-	}
-
-	var fieldResp struct {
-		Data struct {
-			Node struct {
-				Field struct {
-					ID      string        `json:"id"`
-					Options []fieldOption `json:"options"`
-				} `json:"field"`
-			} `json:"node"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(out, &fieldResp); err != nil {
-		return fmt.Errorf("failed to parse Status field response: %w", err)
-	}
-
-	// Check if the existing field already has exactly the right options
-	existing := fieldResp.Data.Node.Field.Options
-	if fieldResp.Data.Node.Field.ID != "" && optionsMatch(existing, statuses) {
-		t.statusFieldID = fieldResp.Data.Node.Field.ID
-		fmt.Println("  Status field already configured correctly")
-		return nil
-	}
-
-	// Delete existing Status field if present
-	if fieldResp.Data.Node.Field.ID != "" {
-		fmt.Println("  Replacing default Status field...")
-		cmd := exec.CommandContext(ctx, "gh", "project", "field-delete",
-			"--id", fieldResp.Data.Node.Field.ID)
-		if deleteOut, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to delete default Status field: %s", strings.TrimSpace(string(deleteOut)))
+		// Options don't match — delete and recreate
+		fmt.Printf("  Updating %s field options...\n", fieldName)
+		cmd := exec.CommandContext(ctx, "gh", "project", "field-delete", "--id", t.fieldID)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to delete existing %s field: %s", fieldName, strings.TrimSpace(string(out)))
 		}
 	}
 
-	// Create new Status field with all required options
+	// Create the Phase field with all options
 	optsList := strings.Join(statuses, ",")
 	cmd := exec.CommandContext(ctx, "gh", "project", "field-create",
 		fmt.Sprintf("%d", t.projectNumber),
 		"--owner", t.owner,
-		"--name", "Status",
+		"--name", fieldName,
 		"--data-type", "SINGLE_SELECT",
 		"--single-select-options", optsList,
 	)
-	createOut, err := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to create Status field: %s", strings.TrimSpace(string(createOut)))
+		return fmt.Errorf("failed to create %s field: %s", fieldName, strings.TrimSpace(string(out)))
 	}
 
 	for _, s := range statuses {
-		fmt.Printf("  Status %q configured\n", s)
+		fmt.Printf("  Phase %q configured\n", s)
 	}
 
-	// Re-discover the new field ID for future use
-	if err := t.Init(ctx); err != nil {
-		return fmt.Errorf("failed to re-initialize after creating Status field: %w", err)
-	}
-
-	return nil
-}
-
-type fieldOption struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-func optionsMatch(existing []fieldOption, required []string) bool {
-	if len(existing) != len(required) {
-		return false
-	}
-	have := make(map[string]bool, len(existing))
-	for _, o := range existing {
-		have[o.Name] = true
-	}
-	for _, r := range required {
-		if !have[r] {
-			return false
-		}
-	}
-	return true
+	// Re-discover the field ID
+	return t.discoverField(ctx)
 }
 
 // CreateProject creates a new GitHub Project V2 and links it to the repository.
@@ -499,7 +464,6 @@ func (t *GitHubProjectTracker) linkToRepo(ctx context.Context) error {
 		return fmt.Errorf("invalid repo format: %s", t.repo)
 	}
 
-	// Get repo node ID
 	repoQuery := fmt.Sprintf(`query {
 		repository(owner: %q, name: %q) { id }
 	}`, parts[0], parts[1])
@@ -525,7 +489,6 @@ func (t *GitHubProjectTracker) linkToRepo(ctx context.Context) error {
 		return fmt.Errorf("repo %s not found", t.repo)
 	}
 
-	// Link project to repo
 	linkMutation := fmt.Sprintf(`mutation {
 		linkProjectV2ToRepository(input: {
 			projectId: %q
@@ -544,7 +507,6 @@ func (t *GitHubProjectTracker) linkToRepo(ctx context.Context) error {
 }
 
 func (t *GitHubProjectTracker) resolveOwnerID(ctx context.Context) (string, error) {
-	// Try user first
 	ownerQuery := fmt.Sprintf(`query { user(login: %q) { id } }`, t.owner)
 	out, err := t.ghGraphQL(ctx, ownerQuery)
 	if err == nil {
@@ -558,7 +520,6 @@ func (t *GitHubProjectTracker) resolveOwnerID(ctx context.Context) (string, erro
 		}
 	}
 
-	// Try org
 	orgQuery := fmt.Sprintf(`query { organization(login: %q) { id } }`, t.owner)
 	out, err = t.ghGraphQL(ctx, orgQuery)
 	if err != nil {
@@ -576,7 +537,7 @@ func (t *GitHubProjectTracker) resolveOwnerID(ctx context.Context) (string, erro
 	return resp.Data.Organization.ID, nil
 }
 
-// ProjectNumber returns the project number (useful after CreateProjectWithStatuses)
+// ProjectNumber returns the project number (useful after CreateProject).
 func (t *GitHubProjectTracker) ProjectNumber() int {
 	return t.projectNumber
 }
@@ -594,8 +555,8 @@ func (t *GitHubProjectTracker) ghGraphQL(ctx context.Context, query string) ([]b
 }
 
 func (t *GitHubProjectTracker) availableStatuses() []string {
-	statuses := make([]string, 0, len(t.statusOptions))
-	for name := range t.statusOptions {
+	statuses := make([]string, 0, len(t.fieldOptions))
+	for name := range t.fieldOptions {
 		statuses = append(statuses, name)
 	}
 	return statuses

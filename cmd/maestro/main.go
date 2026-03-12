@@ -108,7 +108,7 @@ updates WORKFLOW.md with the project number.`,
 				if err := trk.Init(cmd.Context()); err != nil {
 					return fmt.Errorf("failed to find project #%d: %w", cfg.Tracker.ProjectNumber, err)
 				}
-				if err := trk.EnsureStatuses(cmd.Context(), statuses); err != nil {
+				if err := trk.EnsurePhaseField(cmd.Context(), statuses); err != nil {
 					return err
 				}
 				fmt.Println("\nProject statuses configured.")
@@ -121,7 +121,7 @@ updates WORKFLOW.md with the project number.`,
 				}
 				fmt.Printf("Created project #%d\n", trk.ProjectNumber())
 
-				if err := trk.EnsureStatuses(cmd.Context(), statuses); err != nil {
+				if err := trk.EnsurePhaseField(cmd.Context(), statuses); err != nil {
 					return err
 				}
 
