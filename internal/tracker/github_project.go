@@ -52,22 +52,20 @@ func (t *GitHubProjectTracker) discoverProject(ctx context.Context) error {
 	}`, t.owner, t.projectNumber)
 
 	out, err := t.ghGraphQL(ctx, query)
-	if err != nil {
-		return fmt.Errorf("failed to query project: %w", err)
-	}
-
-	var resp struct {
-		Data struct {
-			User *struct {
-				ProjectV2 *struct {
-					ID string `json:"id"`
-				} `json:"projectV2"`
-			} `json:"user"`
-		} `json:"data"`
-	}
-	if json.Unmarshal(out, &resp) == nil && resp.Data.User != nil && resp.Data.User.ProjectV2 != nil {
-		t.projectID = resp.Data.User.ProjectV2.ID
-		return nil
+	if err == nil {
+		var resp struct {
+			Data struct {
+				User *struct {
+					ProjectV2 *struct {
+						ID string `json:"id"`
+					} `json:"projectV2"`
+				} `json:"user"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(out, &resp) == nil && resp.Data.User != nil && resp.Data.User.ProjectV2 != nil {
+			t.projectID = resp.Data.User.ProjectV2.ID
+			return nil
+		}
 	}
 
 	// Try org
