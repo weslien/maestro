@@ -439,7 +439,7 @@ func (t *GitHubProjectTracker) EnsureStatuses(ctx context.Context, statuses []st
 	return nil
 }
 
-// CreateProject creates a new GitHub Project V2 and returns its number.
+// CreateProject creates a new GitHub Project V2 and links it to the repository.
 func (t *GitHubProjectTracker) CreateProject(ctx context.Context, title string) error {
 	ownerID, err := t.resolveOwnerID(ctx)
 	if err != nil {
@@ -479,6 +479,63 @@ func (t *GitHubProjectTracker) CreateProject(ctx context.Context, title string) 
 
 	t.projectID = createResp.Data.CreateProjectV2.ProjectV2.ID
 	t.projectNumber = createResp.Data.CreateProjectV2.ProjectV2.Number
+
+	// Link project to repository
+	if err := t.linkToRepo(ctx); err != nil {
+		fmt.Printf("  Warning: could not link project to repo: %v\n", err)
+	}
+
+	return nil
+}
+
+// linkToRepo links the project to the repository so it appears under the repo's Projects tab.
+func (t *GitHubProjectTracker) linkToRepo(ctx context.Context) error {
+	parts := strings.SplitN(t.repo, "/", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid repo format: %s", t.repo)
+	}
+
+	// Get repo node ID
+	repoQuery := fmt.Sprintf(`query {
+		repository(owner: %q, name: %q) { id }
+	}`, parts[0], parts[1])
+
+	out, err := t.ghGraphQL(ctx, repoQuery)
+	if err != nil {
+		return fmt.Errorf("failed to query repo: %w", err)
+	}
+
+	var repoResp struct {
+		Data struct {
+			Repository struct {
+				ID string `json:"id"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &repoResp); err != nil {
+		return fmt.Errorf("failed to parse repo response: %w", err)
+	}
+
+	repoID := repoResp.Data.Repository.ID
+	if repoID == "" {
+		return fmt.Errorf("repo %s not found", t.repo)
+	}
+
+	// Link project to repo
+	linkMutation := fmt.Sprintf(`mutation {
+		linkProjectV2ToRepository(input: {
+			projectId: %q
+			repositoryId: %q
+		}) {
+			repository { id }
+		}
+	}`, t.projectID, repoID)
+
+	if _, err := t.ghGraphQL(ctx, linkMutation); err != nil {
+		return fmt.Errorf("failed to link project to repo: %w", err)
+	}
+
+	fmt.Printf("  Linked project to %s\n", t.repo)
 	return nil
 }
 

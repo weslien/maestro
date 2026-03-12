@@ -104,9 +104,10 @@ updates WORKFLOW.md with the project number.`,
 				}
 				fmt.Println("\nProject statuses configured.")
 			} else {
-				// Create new project
-				fmt.Printf("Creating GitHub Project for %s...\n", cfg.Tracker.Owner)
-				if err := trk.CreateProject(cmd.Context(), "Maestro Board"); err != nil {
+				// Create new project, named after the repo
+				projectTitle := fmt.Sprintf("Maestro: %s", cfg.Tracker.Repo)
+				fmt.Printf("Creating GitHub Project %q linked to %s...\n", projectTitle, cfg.Tracker.Repo)
+				if err := trk.CreateProject(cmd.Context(), projectTitle); err != nil {
 					return err
 				}
 				fmt.Printf("Created project #%d\n", trk.ProjectNumber())
