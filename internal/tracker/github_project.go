@@ -337,21 +337,22 @@ func (t *GitHubProjectTracker) GetIssue(ctx context.Context, number int) (*Issue
 }
 
 // CreateProjectWithStatuses creates a new GitHub Project V2 with the required status fields
-// EnsureStatuses ensures the project's Status field has exactly the required options.
-// Uses `gh project field-edit` which is the supported way to manage single-select options.
+// EnsureStatuses replaces the project's Status field with one containing exactly
+// the required options. Deletes the default Status field and creates a new one.
 // Idempotent — safe to re-run.
 func (t *GitHubProjectTracker) EnsureStatuses(ctx context.Context, statuses []string) error {
 	if t.projectID == "" {
 		return fmt.Errorf("project not initialized — call Init first")
 	}
 
-	// Discover the Status field ID
+	// Discover the existing Status field ID via GraphQL
 	fieldQuery := fmt.Sprintf(`query {
 		node(id: %q) {
 			... on ProjectV2 {
 				field(name: "Status") {
 					... on ProjectV2SingleSelectField {
 						id
+						options { id name }
 					}
 				}
 			}
@@ -367,7 +368,8 @@ func (t *GitHubProjectTracker) EnsureStatuses(ctx context.Context, statuses []st
 		Data struct {
 			Node struct {
 				Field struct {
-					ID string `json:"id"`
+					ID      string        `json:"id"`
+					Options []fieldOption `json:"options"`
 				} `json:"field"`
 			} `json:"node"`
 		} `json:"data"`
@@ -376,50 +378,69 @@ func (t *GitHubProjectTracker) EnsureStatuses(ctx context.Context, statuses []st
 		return fmt.Errorf("failed to parse Status field response: %w", err)
 	}
 
-	fieldID := fieldResp.Data.Node.Field.ID
-	if fieldID == "" {
-		return fmt.Errorf("could not find Status field on project")
+	// Check if the existing field already has exactly the right options
+	existing := fieldResp.Data.Node.Field.Options
+	if fieldResp.Data.Node.Field.ID != "" && optionsMatch(existing, statuses) {
+		t.statusFieldID = fieldResp.Data.Node.Field.ID
+		fmt.Println("  Status field already configured correctly")
+		return nil
 	}
-	t.statusFieldID = fieldID
 
-	// Build JSON options array for gh project field-edit
-	var opts []string
-	colors := map[string]string{
-		"Backlog":      "GRAY",
-		"Todo":         "BLUE",
-		"Research":     "PURPLE",
-		"Planning":     "PINK",
-		"In Progress":  "YELLOW",
-		"Validation":   "ORANGE",
-		"Human Review": "RED",
-		"Done":         "GREEN",
-		"Cancelled":    "GRAY",
-	}
-	for _, s := range statuses {
-		color := colors[s]
-		if color == "" {
-			color = "GRAY"
+	// Delete existing Status field if present
+	if fieldResp.Data.Node.Field.ID != "" {
+		fmt.Println("  Replacing default Status field...")
+		cmd := exec.CommandContext(ctx, "gh", "project", "field-delete",
+			"--id", fieldResp.Data.Node.Field.ID)
+		if deleteOut, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to delete default Status field: %s", strings.TrimSpace(string(deleteOut)))
 		}
-		opts = append(opts, fmt.Sprintf(`{"name":%q,"color":%q}`, s, color))
 	}
-	optsJSON := "[" + strings.Join(opts, ",") + "]"
 
-	// Use gh project field-edit to set all options at once
-	cmd := exec.CommandContext(ctx, "gh", "project", "field-edit",
-		fieldID,
-		"--project-id", t.projectID,
-		"--single-select-options", optsJSON,
+	// Create new Status field with all required options
+	optsList := strings.Join(statuses, ",")
+	cmd := exec.CommandContext(ctx, "gh", "project", "field-create",
+		fmt.Sprintf("%d", t.projectNumber),
+		"--owner", t.owner,
+		"--name", "Status",
+		"--data-type", "SINGLE_SELECT",
+		"--single-select-options", optsList,
 	)
-	editOut, err := cmd.CombinedOutput()
+	createOut, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to configure status options: %s", strings.TrimSpace(string(editOut)))
+		return fmt.Errorf("failed to create Status field: %s", strings.TrimSpace(string(createOut)))
 	}
 
 	for _, s := range statuses {
 		fmt.Printf("  Status %q configured\n", s)
 	}
 
+	// Re-discover the new field ID for future use
+	if err := t.Init(ctx); err != nil {
+		return fmt.Errorf("failed to re-initialize after creating Status field: %w", err)
+	}
+
 	return nil
+}
+
+type fieldOption struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func optionsMatch(existing []fieldOption, required []string) bool {
+	if len(existing) != len(required) {
+		return false
+	}
+	have := make(map[string]bool, len(existing))
+	for _, o := range existing {
+		have[o.Name] = true
+	}
+	for _, r := range required {
+		if !have[r] {
+			return false
+		}
+	}
+	return true
 }
 
 // CreateProject creates a new GitHub Project V2 and links it to the repository.

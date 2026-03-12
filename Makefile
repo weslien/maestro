@@ -8,8 +8,8 @@ LDFLAGS  = -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DA
 build:
 	go build -ldflags "$(LDFLAGS)" -o maestro ./cmd/maestro/
 
-install:
-	go install -ldflags "$(LDFLAGS)" ./cmd/maestro/
+install: build
+	cp maestro $(HOME)/bin/maestro
 
 clean:
 	rm -f maestro
