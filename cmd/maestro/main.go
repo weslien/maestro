@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"syscall"
 	"time"
@@ -89,8 +90,17 @@ func setupCmd() *cobra.Command {
 			trk := tracker.NewGitHubProjectTracker(cfg.Tracker.Owner, cfg.Tracker.Repo, cfg.Tracker.ProjectNumber)
 			statuses := lifecycle.AllStatuses()
 
-			fmt.Printf("Creating GitHub Project for %s with statuses: %v\n", cfg.Tracker.Owner, statuses)
-			return trk.CreateProjectWithStatuses(cmd.Context(), "Maestro Board", statuses)
+			fmt.Printf("Creating GitHub Project for %s...\n", cfg.Tracker.Owner)
+			if err := trk.CreateProjectWithStatuses(cmd.Context(), "Maestro Board", statuses); err != nil {
+				return err
+			}
+
+			// Auto-update WORKFLOW.md with the new project number
+			if _, statErr := os.Stat(cfgFile); statErr == nil {
+				patchProjectNumber(cfgFile, trk.ProjectNumber())
+			}
+
+			return nil
 		},
 	}
 }
@@ -315,6 +325,21 @@ func stringsSplit(s string) []string {
 		lines = append(lines, s[start:])
 	}
 	return lines
+}
+
+var projectNumberRe = regexp.MustCompile(`(?m)^(\s*project_number:\s*)(\d+)`)
+
+func patchProjectNumber(path string, number int) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	updated := projectNumberRe.ReplaceAll(data, []byte(fmt.Sprintf("${1}%d", number)))
+	if err := os.WriteFile(path, updated, 0o644); err != nil {
+		fmt.Printf("Warning: could not update %s with project number: %v\n", path, err)
+		return
+	}
+	fmt.Printf("Updated %s with project_number: %d\n", path, number)
 }
 
 func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator) error {

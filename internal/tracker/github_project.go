@@ -411,11 +411,107 @@ func (t *GitHubProjectTracker) CreateProjectWithStatuses(ctx context.Context, ti
 	t.projectID = createResp.Data.CreateProjectV2.ProjectV2.ID
 	t.projectNumber = createResp.Data.CreateProjectV2.ProjectV2.Number
 
-	fmt.Printf("Created project #%d (ID: %s)\n", t.projectNumber, t.projectID)
-	fmt.Println("Note: Please configure the Status field options manually in GitHub Project settings.")
-	fmt.Println("Required statuses:", strings.Join(statuses, ", "))
+	fmt.Printf("Created project #%d\n", t.projectNumber)
 
+	// Discover the Status field and its existing options
+	fieldQuery := fmt.Sprintf(`query {
+		node(id: %q) {
+			... on ProjectV2 {
+				field(name: "Status") {
+					... on ProjectV2SingleSelectField {
+						id
+						options { id name }
+					}
+				}
+			}
+		}
+	}`, t.projectID)
+
+	out, err = t.ghGraphQL(ctx, fieldQuery)
+	if err != nil {
+		return fmt.Errorf("failed to query Status field: %w", err)
+	}
+
+	var fieldResp struct {
+		Data struct {
+			Node struct {
+				Field struct {
+					ID      string `json:"id"`
+					Options []struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"options"`
+				} `json:"field"`
+			} `json:"node"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &fieldResp); err != nil {
+		return fmt.Errorf("failed to parse Status field response: %w", err)
+	}
+
+	t.statusFieldID = fieldResp.Data.Node.Field.ID
+
+	// Build set of existing option names
+	existing := make(map[string]bool)
+	for _, opt := range fieldResp.Data.Node.Field.Options {
+		existing[opt.Name] = true
+	}
+
+	// Create missing status options
+	for _, status := range statuses {
+		if existing[status] {
+			fmt.Printf("  Status %q already exists\n", status)
+			continue
+		}
+
+		createOptMutation := fmt.Sprintf(`mutation {
+			createProjectV2FieldOption(input: {
+				projectId: %q
+				fieldId: %q
+				name: %q
+			}) {
+				projectV2FieldOption { id name }
+			}
+		}`, t.projectID, t.statusFieldID, status)
+
+		if _, err := t.ghGraphQL(ctx, createOptMutation); err != nil {
+			return fmt.Errorf("failed to create status option %q: %w", status, err)
+		}
+		fmt.Printf("  Created status %q\n", status)
+	}
+
+	// Delete default options that aren't in our required set
+	required := make(map[string]bool)
+	for _, s := range statuses {
+		required[s] = true
+	}
+	for _, opt := range fieldResp.Data.Node.Field.Options {
+		if !required[opt.Name] {
+			deleteOptMutation := fmt.Sprintf(`mutation {
+				deleteProjectV2FieldOption(input: {
+					projectId: %q
+					fieldId: %q
+					optionId: %q
+				}) {
+					projectV2FieldOption { id }
+				}
+			}`, t.projectID, t.statusFieldID, opt.ID)
+
+			if _, err := t.ghGraphQL(ctx, deleteOptMutation); err != nil {
+				fmt.Printf("  Warning: could not remove default status %q: %v\n", opt.Name, err)
+			} else {
+				fmt.Printf("  Removed default status %q\n", opt.Name)
+			}
+		}
+	}
+
+	fmt.Printf("\nProject ready! Set project_number: %d in your WORKFLOW.md\n", t.projectNumber)
 	return nil
+}
+
+// ProjectNumber returns the project number (useful after CreateProjectWithStatuses)
+func (t *GitHubProjectTracker) ProjectNumber() int {
+	return t.projectNumber
 }
 
 func (t *GitHubProjectTracker) ghGraphQL(ctx context.Context, query string) ([]byte, error) {
