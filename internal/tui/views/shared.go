@@ -1,13 +1,16 @@
-package tui
+package views
 
 import "github.com/charmbracelet/lipgloss"
 
-var (
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("170")).
-			PaddingLeft(1)
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
 
+// Shared styles used across views
+var (
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("39")).
@@ -42,14 +45,8 @@ var (
 	logErrorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196"))
 
-	statusBarStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("236")).
-			Foreground(lipgloss.Color("252")).
-			PaddingLeft(1).
-			PaddingRight(1)
-
-	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241"))
+	selectedMarker = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
+	statusStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 )
 
 func phaseStyle(phase string) lipgloss.Style {

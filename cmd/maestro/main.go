@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sync"
 	"strconv"
 	"syscall"
 	"time"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/weslien/maestro/internal/agent"
 	"github.com/weslien/maestro/internal/config"
+	"github.com/weslien/maestro/internal/gsdstate"
 	"github.com/weslien/maestro/internal/lifecycle"
 	"github.com/weslien/maestro/internal/orchestrator"
 	"github.com/weslien/maestro/internal/seed"
@@ -165,17 +167,65 @@ func seedCmd() *cobra.Command {
 				return fmt.Errorf("failed to initialize tracker: %w", err)
 			}
 
-			result, err := seed.Seed(cmd.Context(), trk, state, cfg.Tracker.Repo)
+			// Spinner frames for animated progress
+			frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+			frameIdx := 0
+			spinnerDone := make(chan struct{})
+			var currentStatus string
+			var statusMu sync.Mutex
+
+			// Spinner goroutine — updates the current line at 80ms intervals
+			go func() {
+				ticker := time.NewTicker(80 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-spinnerDone:
+						return
+					case <-ticker.C:
+						statusMu.Lock()
+						s := currentStatus
+						statusMu.Unlock()
+						if s != "" {
+							fmt.Fprintf(os.Stderr, "\r\033[K  %s %s", frames[frameIdx%len(frames)], s)
+							frameIdx++
+						}
+					}
+				}
+			}()
+
+			onProgress := func(phase, total int, name, status string) {
+				statusMu.Lock()
+				switch status {
+				case "done":
+					currentStatus = ""
+					statusMu.Unlock()
+					fmt.Fprintf(os.Stderr, "\r\033[K")
+					fmt.Printf("  ✓ [%d/%d] %s\n", phase, total, name)
+				case "skipped":
+					currentStatus = ""
+					statusMu.Unlock()
+					fmt.Fprintf(os.Stderr, "\r\033[K")
+					fmt.Printf("  ~ [%d/%d] %s (exists)\n", phase, total, name)
+				case "error":
+					currentStatus = ""
+					statusMu.Unlock()
+					fmt.Fprintf(os.Stderr, "\r\033[K")
+					fmt.Printf("  ✗ [%d/%d] %s\n", phase, total, name)
+				default:
+					currentStatus = fmt.Sprintf("[%d/%d] %s — %s", phase, total, name, status)
+					statusMu.Unlock()
+				}
+			}
+
+			result, err := seed.Seed(cmd.Context(), trk, state, cfg.Tracker.Repo, onProgress)
+			close(spinnerDone)
+			fmt.Fprintf(os.Stderr, "\r\033[K") // clear spinner line
+
 			if err != nil {
 				return err
 			}
 
-			for _, msg := range result.Created {
-				fmt.Printf("  + %s\n", msg)
-			}
-			for _, msg := range result.Skipped {
-				fmt.Printf("  ~ %s\n", msg)
-			}
 			for _, msg := range result.Errors {
 				fmt.Printf("  ! %s\n", msg)
 			}
@@ -235,8 +285,10 @@ func runCmd() *cobra.Command {
 			}
 
 			// TUI mode
-			model := tui.New(orch)
-			p := tea.NewProgram(model, tea.WithAltScreen())
+			cwd, _ := os.Getwd()
+			gsd := gsdstate.NewProvider(cwd, 30*time.Second)
+			app := tui.NewApp(orch, gsd)
+			p := tea.NewProgram(app, tea.WithAltScreen())
 			_, err = p.Run()
 			return err
 		},

@@ -141,6 +141,70 @@ func (o *Orchestrator) Stop() {
 	}
 }
 
+// Tracker returns the underlying tracker for direct queries
+func (o *Orchestrator) Tracker() tracker.Tracker {
+	return o.tracker
+}
+
+// Config returns the orchestrator config
+func (o *Orchestrator) Config() *config.Config {
+	return o.cfg
+}
+
+// StartIssueByNumber fetches an issue from the tracker and starts processing it.
+// Returns an error if the issue is already active or not in an actionable phase.
+func (o *Orchestrator) StartIssueByNumber(ctx context.Context, issueNumber int) error {
+	o.mu.Lock()
+	_, running := o.active[issueNumber]
+	o.mu.Unlock()
+	if running {
+		return fmt.Errorf("issue #%d is already being processed", issueNumber)
+	}
+
+	// Poll to find the issue with its current phase
+	issues, err := o.tracker.Poll(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to poll tracker: %w", err)
+	}
+
+	var target *tracker.Issue
+	for i := range issues {
+		if issues[i].Number == issueNumber {
+			target = &issues[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("issue #%d not found on project board", issueNumber)
+	}
+
+	phase, err := lifecycle.ParsePhase(target.Status)
+	if err != nil {
+		return fmt.Errorf("issue #%d has unknown phase %q", issueNumber, target.Status)
+	}
+	if !lifecycle.IsActionable(phase) {
+		return fmt.Errorf("issue #%d is in %s — not actionable", issueNumber, target.Status)
+	}
+
+	o.startIssue(ctx, *target, phase)
+	return nil
+}
+
+// AdvanceIssuePhase moves an issue to a specific phase on the tracker without processing it
+func (o *Orchestrator) AdvanceIssuePhase(ctx context.Context, issueNumber int, newPhase string) error {
+	issues, err := o.tracker.Poll(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to poll tracker: %w", err)
+	}
+
+	for _, issue := range issues {
+		if issue.Number == issueNumber {
+			return o.tracker.UpdateStatus(ctx, issue, newPhase)
+		}
+	}
+	return fmt.Errorf("issue #%d not found on project board", issueNumber)
+}
+
 // StopIssue stops processing a specific issue
 func (o *Orchestrator) StopIssue(issueNumber int) error {
 	o.mu.Lock()

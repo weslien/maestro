@@ -85,3 +85,19 @@ func (tm *TmuxManager) CleanupOrphaned(ctx context.Context) error {
 
 	return nil
 }
+
+// CreateInteractiveSession creates a tmux session running an interactive command
+func (tm *TmuxManager) CreateInteractiveSession(ctx context.Context, name string, command []string) error {
+	if tm.SessionExists(ctx, name) {
+		return nil
+	}
+
+	args := []string{"new-session", "-d", "-s", name}
+	args = append(args, command...)
+	cmd := exec.CommandContext(ctx, "tmux", args...)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to create interactive tmux session %s: %w", name, err)
+	}
+
+	return nil
+}
