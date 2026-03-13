@@ -48,6 +48,11 @@ func PhaseToMaestro(gsdStatus string) string {
 	}
 }
 
+// PlanToMaestro maps GSD plan status to maestro Phase field values.
+func PlanToMaestro(gsdStatus string) string {
+	return PhaseToMaestro(gsdStatus)
+}
+
 // NormalizeStatus lowercases a GSD status for consistent comparison
 func NormalizeStatus(status string) string {
 	return strings.ToLower(status)

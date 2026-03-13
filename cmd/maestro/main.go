@@ -8,8 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"sync"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/weslien/maestro/internal/agent"
+	"github.com/weslien/maestro/internal/bridge"
 	"github.com/weslien/maestro/internal/config"
 	"github.com/weslien/maestro/internal/gsdstate"
 	"github.com/weslien/maestro/internal/lifecycle"
@@ -38,9 +39,9 @@ var (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "maestro",
-		Short: "GSD-powered GitHub Projects orchestrator",
-		Long:  "Maestro polls GitHub Projects V2 for issues and runs each through a GSD-style lifecycle using Claude Code agents.",
+		Use:     "maestro",
+		Short:   "GSD-powered GitHub Projects orchestrator",
+		Long:    "Maestro polls GitHub Projects V2 for issues and runs each through a GSD-style lifecycle using Claude Code agents.",
 		Version: fmt.Sprintf("%s (commit: %s, built: %s)", version, commit, date),
 	}
 
@@ -53,6 +54,7 @@ func main() {
 		runCmd(),
 		statusCmd(),
 		stopCmd(),
+		bridgeCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -91,12 +93,17 @@ func initCmd() *cobra.Command {
 }
 
 func setupCmd() *cobra.Command {
-	return &cobra.Command{
+	var template string
+
+	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Ensure a GitHub Project exists with required status fields",
+		Short: "Ensure a GitHub Project exists with required fields and issue types",
 		Long: `If project_number is set in WORKFLOW.md, ensures that project has
-the correct status fields. Otherwise creates a new project and
-updates WORKFLOW.md with the project number.`,
+the correct status fields and issue types (Milestone, Phase, Task).
+Otherwise creates a new project and updates WORKFLOW.md with the project number.
+
+Use --template to copy from a template project that includes pre-configured views.
+Pass --template=maestro to use the built-in GSD template, or pass a project node ID.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
 			if err != nil {
@@ -115,9 +122,34 @@ updates WORKFLOW.md with the project number.`,
 				if err := trk.EnsurePhaseField(cmd.Context(), statuses); err != nil {
 					return err
 				}
-				fmt.Println("\nProject statuses configured.")
+				fmt.Println("Project statuses configured.")
+			} else if template != "" {
+				// Copy from template project
+				sourceID := template
+				if sourceID == "maestro" {
+					if tracker.TemplateProjectID == "" {
+						return fmt.Errorf("built-in template project ID not configured yet — pass a project node ID instead")
+					}
+					sourceID = tracker.TemplateProjectID
+				}
+
+				projectTitle := fmt.Sprintf("Maestro: %s", cfg.Tracker.Repo)
+				fmt.Printf("Copying template project to %q linked to %s...\n", projectTitle, cfg.Tracker.Repo)
+				if err := trk.CopyProject(cmd.Context(), sourceID, projectTitle); err != nil {
+					return err
+				}
+				fmt.Printf("Created project #%d (copied from template)\n", trk.ProjectNumber())
+
+				if err := trk.EnsurePhaseField(cmd.Context(), statuses); err != nil {
+					return err
+				}
+
+				// Auto-update WORKFLOW.md with the new project number
+				if _, statErr := os.Stat(cfgFile); statErr == nil {
+					patchProjectNumber(cfgFile, trk.ProjectNumber())
+				}
 			} else {
-				// Create new project, named after the repo
+				// Create new blank project, named after the repo
 				projectTitle := fmt.Sprintf("Maestro: %s", cfg.Tracker.Repo)
 				fmt.Printf("Creating GitHub Project %q linked to %s...\n", projectTitle, cfg.Tracker.Repo)
 				if err := trk.CreateProject(cmd.Context(), projectTitle); err != nil {
@@ -135,16 +167,52 @@ updates WORKFLOW.md with the project number.`,
 				}
 			}
 
+			// Ensure issue types (Milestone, Phase, Task) exist at org level
+			fmt.Println("Ensuring issue types...")
+			if err := trk.EnsureIssueTypes(cmd.Context()); err != nil {
+				fmt.Printf("  Warning: could not configure issue types: %v\n", err)
+				fmt.Println("  (Issue types require org admin permissions)")
+			} else {
+				for _, t := range tracker.MaestroIssueTypes() {
+					fmt.Printf("  ✓ %s\n", t)
+				}
+			}
+
+			// Validate views and print warnings
+			fmt.Println("\nValidating project views...")
+			warnings, err := trk.ValidateViews(cmd.Context())
+			if err != nil {
+				fmt.Printf("  Warning: could not validate views: %v\n", err)
+			} else if len(warnings) == 0 {
+				fmt.Println("  All views configured correctly.")
+			} else {
+				for _, w := range warnings {
+					fmt.Printf("  ⚠ %s\n", w)
+				}
+				fmt.Println("\n  Note: Views cannot be configured via API.")
+				fmt.Println("  Open the project in GitHub and configure views manually,")
+				fmt.Println("  or re-run with --template to copy from a pre-configured template.")
+			}
+
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&template, "template", "", "copy from a template project (use 'maestro' for built-in, or a project node ID)")
+	return cmd
 }
 
 func seedCmd() *cobra.Command {
-	return &cobra.Command{
+	var update bool
+
+	cmd := &cobra.Command{
 		Use:   "seed",
-		Short: "Seed GitHub Project with GSD phases from stclaude",
-		Long:  "Reads GSD project state via stclaude CLI and creates GitHub issues for each phase on the project board.",
+		Short: "Seed GitHub Project with GSD phases and plans from stclaude",
+		Long: `Reads GSD project state via stclaude CLI and creates GitHub issues
+for each phase and its plans on the project board.
+
+Use --update to re-apply issue types, sub-issue relationships, and
+dependencies to existing issues (idempotent).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
 			if err != nil {
@@ -160,11 +228,17 @@ func seedCmd() *cobra.Command {
 			}
 
 			fmt.Printf("Project: %s\n", state.Data.Project.Name)
-			fmt.Printf("Phases: %d\n\n", len(state.Data.Phases))
+			fmt.Printf("Phases: %d, Plans: %d\n\n", len(state.Data.Phases), len(state.Data.Plans))
 
 			trk := tracker.NewGitHubProjectTracker(cfg.Tracker.Owner, cfg.Tracker.Repo, cfg.Tracker.ProjectNumber)
 			if err := trk.Init(cmd.Context()); err != nil {
 				return fmt.Errorf("failed to initialize tracker: %w", err)
+			}
+
+			// Ensure issue types exist before seeding
+			if err := trk.EnsureIssueTypes(cmd.Context()); err != nil {
+				fmt.Printf("Warning: issue types not available: %v\n", err)
+				fmt.Println("(Continuing without issue types — run 'maestro setup' with org admin permissions)")
 			}
 
 			// Spinner frames for animated progress
@@ -202,6 +276,11 @@ func seedCmd() *cobra.Command {
 					statusMu.Unlock()
 					fmt.Fprintf(os.Stderr, "\r\033[K")
 					fmt.Printf("  ✓ [%d/%d] %s\n", phase, total, name)
+				case "updated":
+					currentStatus = ""
+					statusMu.Unlock()
+					fmt.Fprintf(os.Stderr, "\r\033[K")
+					fmt.Printf("  ✓ [%d/%d] %s (updated)\n", phase, total, name)
 				case "skipped":
 					currentStatus = ""
 					statusMu.Unlock()
@@ -218,7 +297,7 @@ func seedCmd() *cobra.Command {
 				}
 			}
 
-			result, err := seed.Seed(cmd.Context(), trk, state, cfg.Tracker.Repo, onProgress)
+			result, err := seed.Seed(cmd.Context(), trk, state, cfg.Tracker.Repo, cwd, update, onProgress)
 			close(spinnerDone)
 			fmt.Fprintf(os.Stderr, "\r\033[K") // clear spinner line
 
@@ -235,6 +314,9 @@ func seedCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&update, "update", false, "re-apply types, sub-issues, and dependencies to existing issues")
+	return cmd
 }
 
 func runCmd() *cobra.Command {
@@ -357,6 +439,83 @@ func stopCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func bridgeCmd() *cobra.Command {
+	var (
+		port          int
+		webhookSecret string
+		publisherType string
+		outputFile    string
+		iggyAddr      string
+		streamName    string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "bridge",
+		Short: "Start webhook-to-stream bridge",
+		Long: `Starts an HTTP server that receives GitHub webhook events for Projects V2
+and publishes them to a message stream (Iggy, file, or stdout).`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if webhookSecret == "" {
+				webhookSecret = os.Getenv("MAESTRO_WEBHOOK_SECRET")
+			}
+			if webhookSecret == "" {
+				return fmt.Errorf("webhook secret is required (use --webhook-secret or MAESTRO_WEBHOOK_SECRET env)")
+			}
+
+			var pub bridge.Publisher
+			switch publisherType {
+			case "log":
+				pub = bridge.NewLogPublisher()
+			case "file":
+				if outputFile == "" {
+					return fmt.Errorf("--output is required when using file publisher")
+				}
+				fp, err := bridge.NewFilePublisher(outputFile)
+				if err != nil {
+					return err
+				}
+				pub = fp
+			case "iggy":
+				return fmt.Errorf("iggy publisher requires a running Iggy server at %s — not yet fully wired", iggyAddr)
+			default:
+				return fmt.Errorf("unknown publisher type %q (options: log, file, iggy)", publisherType)
+			}
+
+			b, err := bridge.New(
+				bridge.WithAddr(fmt.Sprintf(":%d", port)),
+				bridge.WithWebhookSecret(webhookSecret),
+				bridge.WithPublisher(pub),
+				bridge.WithEnricher(bridge.NewGHEnricher()),
+			)
+			if err != nil {
+				return err
+			}
+
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
+
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			go func() {
+				<-sigCh
+				fmt.Println("\nShutting down bridge...")
+				cancel()
+			}()
+
+			return b.Run(ctx)
+		},
+	}
+
+	cmd.Flags().IntVar(&port, "port", 8080, "HTTP listen port")
+	cmd.Flags().StringVar(&webhookSecret, "webhook-secret", "", "GitHub webhook secret (or MAESTRO_WEBHOOK_SECRET env)")
+	cmd.Flags().StringVar(&publisherType, "publisher", "log", "publisher type: log, file, iggy")
+	cmd.Flags().StringVar(&outputFile, "output", "", "output file path (for file publisher)")
+	cmd.Flags().StringVar(&iggyAddr, "iggy-addr", "localhost:8090", "Iggy server address")
+	cmd.Flags().StringVar(&streamName, "stream", "github-events", "Iggy stream name")
+
+	return cmd
 }
 
 // loadConfig loads from WORKFLOW.md if it exists, otherwise auto-detects from git.

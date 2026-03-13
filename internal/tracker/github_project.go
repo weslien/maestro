@@ -535,6 +535,229 @@ func (t *GitHubProjectTracker) resolveOwnerID(ctx context.Context) (string, erro
 	return resp.Data.Organization.ID, nil
 }
 
+// CopyProject copies a source project (by node ID) to create a new project
+// with the same views and configuration, then links it to the repository.
+func (t *GitHubProjectTracker) CopyProject(ctx context.Context, sourceProjectID, title string) error {
+	ownerID, err := t.resolveOwnerID(ctx)
+	if err != nil {
+		return err
+	}
+
+	mutation := fmt.Sprintf(`mutation {
+		copyProjectV2(input: {
+			projectId: %q
+			ownerId: %q
+			title: %q
+			includeDraftIssues: false
+		}) {
+			projectV2 {
+				id
+				number
+			}
+		}
+	}`, sourceProjectID, ownerID, title)
+
+	out, err := t.ghGraphQL(ctx, mutation)
+	if err != nil {
+		return fmt.Errorf("failed to copy project: %w", err)
+	}
+
+	var resp struct {
+		Data struct {
+			CopyProjectV2 struct {
+				ProjectV2 struct {
+					ID     string `json:"id"`
+					Number int    `json:"number"`
+				} `json:"projectV2"`
+			} `json:"copyProjectV2"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return fmt.Errorf("failed to parse copy response: %w", err)
+	}
+
+	t.projectID = resp.Data.CopyProjectV2.ProjectV2.ID
+	t.projectNumber = resp.Data.CopyProjectV2.ProjectV2.Number
+
+	if err := t.linkToRepo(ctx); err != nil {
+		fmt.Printf("  Warning: could not link project to repo: %v\n", err)
+	}
+
+	return nil
+}
+
+// QueryViews reads all views from the project with their layout, fields, and grouping.
+func (t *GitHubProjectTracker) QueryViews(ctx context.Context) ([]ViewInfo, error) {
+	if t.projectID == "" {
+		return nil, fmt.Errorf("project not initialized")
+	}
+
+	query := fmt.Sprintf(`query {
+		node(id: %q) {
+			... on ProjectV2 {
+				views(first: 20) {
+					nodes {
+						id
+						name
+						number
+						layout
+						filter
+						fields(first: 20) {
+							nodes {
+								... on ProjectV2Field { id name }
+								... on ProjectV2SingleSelectField { id name }
+								... on ProjectV2IterationField { id name }
+							}
+						}
+						groupByFields(first: 10) {
+							nodes {
+								... on ProjectV2Field { id name }
+								... on ProjectV2SingleSelectField { id name }
+							}
+						}
+						verticalGroupByFields(first: 10) {
+							nodes {
+								... on ProjectV2Field { id name }
+								... on ProjectV2SingleSelectField { id name }
+							}
+						}
+					}
+				}
+			}
+		}
+	}`, t.projectID)
+
+	out, err := t.ghGraphQL(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query views: %w", err)
+	}
+
+	var resp struct {
+		Data struct {
+			Node struct {
+				Views struct {
+					Nodes []struct {
+						ID     string `json:"id"`
+						Name   string `json:"name"`
+						Number int    `json:"number"`
+						Layout string `json:"layout"`
+						Filter string `json:"filter"`
+						Fields struct {
+							Nodes []struct {
+								ID   string `json:"id"`
+								Name string `json:"name"`
+							} `json:"nodes"`
+						} `json:"fields"`
+						GroupByFields struct {
+							Nodes []struct {
+								ID   string `json:"id"`
+								Name string `json:"name"`
+							} `json:"nodes"`
+						} `json:"groupByFields"`
+						VerticalGroupByFields struct {
+							Nodes []struct {
+								ID   string `json:"id"`
+								Name string `json:"name"`
+							} `json:"nodes"`
+						} `json:"verticalGroupByFields"`
+					} `json:"nodes"`
+				} `json:"views"`
+			} `json:"node"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse views response: %w", err)
+	}
+
+	var views []ViewInfo
+	for _, v := range resp.Data.Node.Views.Nodes {
+		vi := ViewInfo{
+			ID:     v.ID,
+			Name:   v.Name,
+			Number: v.Number,
+			Layout: v.Layout,
+			Filter: v.Filter,
+		}
+		for _, f := range v.Fields.Nodes {
+			if f.ID != "" {
+				vi.Fields = append(vi.Fields, ViewField{ID: f.ID, Name: f.Name})
+			}
+		}
+		for _, f := range v.GroupByFields.Nodes {
+			if f.ID != "" {
+				vi.GroupByFields = append(vi.GroupByFields, ViewField{ID: f.ID, Name: f.Name})
+			}
+		}
+		for _, f := range v.VerticalGroupByFields.Nodes {
+			if f.ID != "" {
+				vi.VerticalGroupByFields = append(vi.VerticalGroupByFields, ViewField{ID: f.ID, Name: f.Name})
+			}
+		}
+		views = append(views, vi)
+	}
+
+	return views, nil
+}
+
+// ValidateViews checks that the project views are correctly configured for GSD.
+// Returns a list of warnings for any misconfiguration found.
+func (t *GitHubProjectTracker) ValidateViews(ctx context.Context) ([]string, error) {
+	views, err := t.QueryViews(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query views: %w", err)
+	}
+
+	var warnings []string
+
+	// Check for at least one BOARD_LAYOUT view
+	var boardViews []ViewInfo
+	var tableViews []ViewInfo
+	var roadmapViews []ViewInfo
+
+	for _, v := range views {
+		switch v.Layout {
+		case "BOARD_LAYOUT":
+			boardViews = append(boardViews, v)
+		case "TABLE_LAYOUT":
+			tableViews = append(tableViews, v)
+		case "ROADMAP_LAYOUT":
+			roadmapViews = append(roadmapViews, v)
+		}
+	}
+
+	if len(boardViews) == 0 {
+		warnings = append(warnings, "no BOARD_LAYOUT view found — add a Board view grouped by Phase for kanban-style tracking")
+	} else {
+		// Check that at least one board view has the Phase field
+		hasPhaseField := false
+		for _, bv := range boardViews {
+			for _, f := range bv.Fields {
+				if f.Name == fieldName {
+					hasPhaseField = true
+					break
+				}
+			}
+			if hasPhaseField {
+				break
+			}
+		}
+		if !hasPhaseField {
+			warnings = append(warnings, fmt.Sprintf("no Board view has the %q field — add it so items can be grouped by phase", fieldName))
+		}
+	}
+
+	if len(tableViews) == 0 {
+		warnings = append(warnings, "no TABLE_LAYOUT view found — add a Table view for hierarchy and bulk editing")
+	}
+
+	if len(roadmapViews) == 0 {
+		warnings = append(warnings, "no ROADMAP_LAYOUT view found — consider adding a Roadmap view for timeline visibility (optional)")
+	}
+
+	return warnings, nil
+}
+
 // ProjectNumber returns the project number (useful after CreateProject).
 func (t *GitHubProjectTracker) ProjectNumber() int {
 	return t.projectNumber
