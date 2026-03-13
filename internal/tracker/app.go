@@ -31,7 +31,7 @@ func appManifest(webhookURL, redirectURL string) map[string]interface{} {
 		"name":        "maestro-bridge",
 		"url":         "https://github.com/weslien/maestro",
 		"description": "Maestro webhook bridge for GitHub Projects V2 events",
-		"public":      false,
+		"public":      true,
 		"hook_attributes": map[string]interface{}{
 			"url":    webhookURL,
 			"active": true,
