@@ -93,10 +93,7 @@ func initCmd() *cobra.Command {
 }
 
 func setupCmd() *cobra.Command {
-	var (
-		template string
-		app      bool
-	)
+	var template string
 
 	cmd := &cobra.Command{
 		Use:   "setup",
@@ -108,8 +105,8 @@ Otherwise creates a new project and updates WORKFLOW.md with the project number.
 Use --template to copy from a template project that includes pre-configured views.
 Pass --template=maestro to use the built-in GSD template, or pass a project node ID.
 
-Use --app to create a GitHub App for receiving Projects V2 webhook events.
-This is required for the bridge to receive real-time project updates.`,
+If bridge.webhook_url is set in WORKFLOW.md, setup will create a GitHub App
+(first run) or prompt you to install the existing app (subsequent runs).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
 			if err != nil {
@@ -200,19 +197,15 @@ This is required for the bridge to receive real-time project updates.`,
 				fmt.Println("  or re-run with --template to copy from a pre-configured template.")
 			}
 
-			// Create GitHub App for webhook events
-			if app {
-				if cfg.Bridge.WebhookURL == "" {
-					return fmt.Errorf("bridge.webhook_url must be set in WORKFLOW.md to create a GitHub App")
-				}
+			// GitHub App setup for webhook events (when bridge URL is configured)
+			if cfg.Bridge.WebhookURL != "" {
+				fmt.Println("\nConfiguring webhook bridge...")
 
-				// Check if app already exists
-				if existing, err := tracker.LoadAppCredentials(); err == nil {
-					fmt.Printf("\nGitHub App already configured (id=%d, slug=%s)\n", existing.AppID, existing.AppSlug)
-					fmt.Println("  Delete .maestro/app.json to recreate.")
-				} else {
-					fmt.Println("\nCreating GitHub App for Projects V2 webhooks...")
-					creds, err := trk.CreateApp(cmd.Context(), cfg.Bridge.WebhookURL)
+				creds, err := tracker.LoadAppCredentials()
+				if err != nil {
+					// No app yet — create one
+					fmt.Println("  Creating GitHub App for Projects V2 webhooks...")
+					creds, err = trk.CreateApp(cmd.Context(), cfg.Bridge.WebhookURL)
 					if err != nil {
 						return fmt.Errorf("failed to create GitHub App: %w", err)
 					}
@@ -224,10 +217,23 @@ This is required for the bridge to receive real-time project updates.`,
 						fmt.Printf("  Warning: could not save credentials: %v\n", err)
 						fmt.Println("  Save the credentials above manually!")
 					}
+				} else {
+					fmt.Printf("  GitHub App: %s (id=%d)\n", creds.AppSlug, creds.AppID)
+				}
 
-					// Prompt to install the app
-					fmt.Println("\n  Next: install the app on your account/org to start receiving events.")
+				// Check installation status and prompt if needed
+				installed, _ := tracker.CheckAppInstallation(cmd.Context(), creds, cfg.Tracker.Owner)
+				if !installed {
+					fmt.Printf("  App not yet installed on %s — opening install page...\n", cfg.Tracker.Owner)
 					trk.InstallApp(creds)
+					fmt.Print("  Press Enter after installing the app...")
+					fmt.Scanln()
+					if err := tracker.MarkAppInstalled(cfg.Tracker.Owner); err != nil {
+						fmt.Printf("  Warning: could not save install marker: %v\n", err)
+					}
+					fmt.Printf("  App installed on %s ✓\n", cfg.Tracker.Owner)
+				} else {
+					fmt.Printf("  App installed on %s ✓\n", cfg.Tracker.Owner)
 				}
 			}
 
@@ -236,7 +242,6 @@ This is required for the bridge to receive real-time project updates.`,
 	}
 
 	cmd.Flags().StringVar(&template, "template", "", "copy from a template project (use 'maestro' for built-in, or a project node ID)")
-	cmd.Flags().BoolVar(&app, "app", false, "create a GitHub App for receiving Projects V2 webhook events")
 	return cmd
 }
 

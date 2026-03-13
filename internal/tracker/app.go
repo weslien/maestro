@@ -161,14 +161,26 @@ func (t *GitHubProjectTracker) InstallApp(creds *AppCredentials) {
 	openBrowser(installURL)
 }
 
-// SaveAppCredentials writes the app credentials to .maestro/app.json.
+// appCredentialsPath returns ~/.config/maestro/app.json.
+func appCredentialsPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to find home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "maestro", "app.json"), nil
+}
+
+// SaveAppCredentials writes the app credentials to ~/.config/maestro/app.json.
 func SaveAppCredentials(creds *AppCredentials) error {
-	dir := ".maestro"
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("failed to create %s: %w", dir, err)
+	path, err := appCredentialsPath()
+	if err != nil {
+		return err
 	}
 
-	path := filepath.Join(dir, "app.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("failed to create config dir: %w", err)
+	}
+
 	data, err := json.MarshalIndent(creds, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal credentials: %w", err)
@@ -182,9 +194,13 @@ func SaveAppCredentials(creds *AppCredentials) error {
 	return nil
 }
 
-// LoadAppCredentials reads app credentials from .maestro/app.json.
+// LoadAppCredentials reads app credentials from ~/.config/maestro/app.json.
 func LoadAppCredentials() (*AppCredentials, error) {
-	path := filepath.Join(".maestro", "app.json")
+	path, err := appCredentialsPath()
+	if err != nil {
+		return nil, err
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -195,6 +211,29 @@ func LoadAppCredentials() (*AppCredentials, error) {
 		return nil, fmt.Errorf("failed to parse %s: %w", path, err)
 	}
 	return &creds, nil
+}
+
+// CheckAppInstallation checks if the GitHub App is installed on the given owner
+// by looking for a local marker file. The marker is created when the user
+// confirms installation after the browser flow.
+func CheckAppInstallation(ctx context.Context, creds *AppCredentials, owner string) (bool, error) {
+	path, err := appCredentialsPath()
+	if err != nil {
+		return false, err
+	}
+	markerPath := filepath.Join(filepath.Dir(path), "installed-"+owner)
+	_, err = os.Stat(markerPath)
+	return err == nil, nil
+}
+
+// MarkAppInstalled creates a marker file indicating the app is installed on owner.
+func MarkAppInstalled(owner string) error {
+	path, err := appCredentialsPath()
+	if err != nil {
+		return err
+	}
+	markerPath := filepath.Join(filepath.Dir(path), "installed-"+owner)
+	return os.WriteFile(markerPath, []byte("installed\n"), 0o600)
 }
 
 func openBrowser(url string) {
