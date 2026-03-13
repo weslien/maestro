@@ -1,9 +1,9 @@
 ---
 tracker:
   kind: github_project
-  owner: "your-username"
-  project_number: 0
-  repo: "owner/repo"
+  owner: "weslien"
+  project_number: 3
+  repo: "weslien/maestro"
 workspace:
   root: .maestro/worktrees
 agent:
@@ -19,6 +19,8 @@ polling:
   interval: 30s
 tmux:
   session_prefix: maestro
+bridge:
+  webhook_url: "https://maestro.metal.fnz-qhub.com/webhook"
 ---
 You are working on issue #{{ issue.number }}: {{ issue.title }}
 

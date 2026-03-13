@@ -93,7 +93,10 @@ func initCmd() *cobra.Command {
 }
 
 func setupCmd() *cobra.Command {
-	var template string
+	var (
+		template string
+		app      bool
+	)
 
 	cmd := &cobra.Command{
 		Use:   "setup",
@@ -103,7 +106,10 @@ the correct status fields and issue types (Milestone, Phase, Task).
 Otherwise creates a new project and updates WORKFLOW.md with the project number.
 
 Use --template to copy from a template project that includes pre-configured views.
-Pass --template=maestro to use the built-in GSD template, or pass a project node ID.`,
+Pass --template=maestro to use the built-in GSD template, or pass a project node ID.
+
+Use --app to create a GitHub App for receiving Projects V2 webhook events.
+This is required for the bridge to receive real-time project updates.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
 			if err != nil {
@@ -194,11 +200,43 @@ Pass --template=maestro to use the built-in GSD template, or pass a project node
 				fmt.Println("  or re-run with --template to copy from a pre-configured template.")
 			}
 
+			// Create GitHub App for webhook events
+			if app {
+				if cfg.Bridge.WebhookURL == "" {
+					return fmt.Errorf("bridge.webhook_url must be set in WORKFLOW.md to create a GitHub App")
+				}
+
+				// Check if app already exists
+				if existing, err := tracker.LoadAppCredentials(); err == nil {
+					fmt.Printf("\nGitHub App already configured (id=%d, slug=%s)\n", existing.AppID, existing.AppSlug)
+					fmt.Println("  Delete .maestro/app.json to recreate.")
+				} else {
+					fmt.Println("\nCreating GitHub App for Projects V2 webhooks...")
+					creds, err := trk.CreateApp(cmd.Context(), cfg.Bridge.WebhookURL)
+					if err != nil {
+						return fmt.Errorf("failed to create GitHub App: %w", err)
+					}
+
+					fmt.Printf("\n  App created: %s (id=%d)\n", creds.AppSlug, creds.AppID)
+					fmt.Printf("  Webhook secret: %s\n", creds.WebhookSecret)
+
+					if err := tracker.SaveAppCredentials(creds); err != nil {
+						fmt.Printf("  Warning: could not save credentials: %v\n", err)
+						fmt.Println("  Save the credentials above manually!")
+					}
+
+					// Prompt to install the app
+					fmt.Println("\n  Next: install the app on your account/org to start receiving events.")
+					trk.InstallApp(creds)
+				}
+			}
+
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&template, "template", "", "copy from a template project (use 'maestro' for built-in, or a project node ID)")
+	cmd.Flags().BoolVar(&app, "app", false, "create a GitHub App for receiving Projects V2 webhook events")
 	return cmd
 }
 
@@ -555,6 +593,8 @@ polling:
   interval: 30s
 tmux:
   session_prefix: maestro
+bridge:
+  webhook_url: ""
 ---
 You are working on issue #{{ issue.number }}: {{ issue.title }}
 

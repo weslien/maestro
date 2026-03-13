@@ -16,7 +16,12 @@ type Config struct {
 	Agent          AgentConfig     `yaml:"agent"`
 	Polling        PollingConfig   `yaml:"polling"`
 	Tmux           TmuxConfig      `yaml:"tmux"`
+	Bridge         BridgeConfig    `yaml:"bridge"`
 	PromptTemplate string          `yaml:"-"`
+}
+
+type BridgeConfig struct {
+	WebhookURL string `yaml:"webhook_url"`
 }
 
 type TrackerConfig struct {
