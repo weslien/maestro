@@ -13,4 +13,4 @@ spec:
         - name: maestro-bridge
           port: 8080
   tls:
-    secretName: metal-fnz-qhub-com-tls
+    secretName: oauth2-proxy/metal-fnz-qhub-com-tls
