@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maestro-bridge
+  namespace: maestro-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: maestro-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: maestro-bridge
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: bridge
+          image: ghcr.io/weslien/maestro-bridge:main
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: maestro-bridge
+          env:
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: maestro-bridge
+                  key: webhook-secret
+            - name: IGGY_USER
+              valueFrom:
+                secretKeyRef:
+                  name: maestro-bridge
+                  key: iggy-user
+            - name: IGGY_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: maestro-bridge
+                  key: iggy-pass
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maestro-bridge
+  namespace: maestro-bridge
+data:
+  IGGY_ADDR: "iggy.iggy.svc.cluster.local:8090"
+  IGGY_STREAM: "github-events"
+  IGGY_TOPIC: "projects-v2"
+  IGGY_PARTITIONS: "3"
