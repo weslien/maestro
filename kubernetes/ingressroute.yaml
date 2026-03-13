@@ -1,0 +1,16 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: maestro-bridge
+  namespace: maestro-bridge
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`maestro.metal.fnz-qhub.com`) && Path(`/webhook`)
+      services:
+        - name: maestro-bridge
+          port: 8080
+  tls:
+    secretName: metal-fnz-qhub-com-tls
