@@ -137,6 +137,14 @@ func Seed(ctx context.Context, trk *tracker.GitHubProjectTracker, state *gsdstat
 			if update && phaseNodeID != "" {
 				progress(phase.Name, "updating type")
 				_ = trk.SetIssueType(ctx, phaseNodeID, tracker.TypePhase)
+				// Ensure issue is on the current project board
+				progress(phase.Name, "adding to project")
+				itemID, addErr := addIssueToProject(ctx, trk, owner, repoName, phaseIssueNum)
+				if addErr == nil && itemID != "" {
+					maestroPhase := gsdstate.PhaseToMaestro(phase.Status)
+					issue := tracker.Issue{Number: phaseIssueNum, ProjectItemID: itemID}
+					_ = trk.UpdateStatus(ctx, issue, maestroPhase)
+				}
 				result.Skipped = append(result.Skipped, fmt.Sprintf("Phase %s: %s (updated)", phase.Number, phase.Name))
 				progress(phase.Name, "updated")
 			} else {
@@ -242,6 +250,14 @@ func Seed(ctx context.Context, trk *tracker.GitHubProjectTracker, state *gsdstat
 						_ = trk.SetIssueType(ctx, nodeID, tracker.TypeTask)
 						if phaseNodeID != "" {
 							_ = trk.AddSubIssue(ctx, phaseNodeID, nodeID)
+						}
+						// Ensure issue is on the current project board
+						progress(planName, "adding to project")
+						itemID, addErr := addIssueToProject(ctx, trk, owner, repoName, planIssueNum)
+						if addErr == nil && itemID != "" {
+							maestroStatus := gsdstate.PlanToMaestro(plan.Status)
+							planIssue := tracker.Issue{Number: planIssueNum, ProjectItemID: itemID}
+							_ = trk.UpdateStatus(ctx, planIssue, maestroStatus)
 						}
 						result.Skipped = append(result.Skipped, fmt.Sprintf("%s: %s (updated)", planName, summary))
 						progress(planName, "updated")
